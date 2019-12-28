@@ -1,4 +1,4 @@
-/* Copyright (c) 2012-2016, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2012-2017 The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -34,6 +34,7 @@
 
 static struct v4l2_device *msm_v4l2_dev;
 static struct list_head    ordered_sd_list;
+static struct mutex        ordered_sd_mtx;
 
 static struct pm_qos_request msm_v4l2_pm_qos_request;
 
@@ -285,25 +286,25 @@ void msm_delete_stream(unsigned int session_id, unsigned int stream_id)
 		return;
 
 	while (1) {
-
+		unsigned long wl_flags;
 		if (try_count > 5) {
 			pr_err("%s : not able to delete stream %d\n",
 				__func__, __LINE__);
 			break;
 		}
 
-		write_lock(&session->stream_rwlock);
+		write_lock_irqsave(&session->stream_rwlock, wl_flags);
 		try_count++;
 		stream = msm_queue_find(&session->stream_q, struct msm_stream,
 			list, __msm_queue_find_stream, &stream_id);
 
 		if (!stream) {
-			write_unlock(&session->stream_rwlock);
+			write_unlock_irqrestore(&session->stream_rwlock, wl_flags);
 			return;
 		}
 
 		if (msm_vb2_get_stream_state(stream) != 1) {
-			write_unlock(&session->stream_rwlock);
+			write_unlock_irqrestore(&session->stream_rwlock, wl_flags);
 			continue;
 		}
 
@@ -313,7 +314,7 @@ void msm_delete_stream(unsigned int session_id, unsigned int stream_id)
 		kfree(stream);
 		stream = NULL;
 		spin_unlock_irqrestore(&(session->stream_q.lock), flags);
-		write_unlock(&session->stream_rwlock);
+		write_unlock_irqrestore(&session->stream_rwlock, wl_flags);
 		break;
 	}
 
@@ -404,7 +405,9 @@ int msm_sd_register(struct msm_sd_subdev *msm_subdev)
 	if (WARN_ON(!msm_v4l2_dev) || WARN_ON(!msm_v4l2_dev->dev))
 		return -EIO;
 
+	mutex_lock(&ordered_sd_mtx);
 	msm_add_sd_in_position(msm_subdev, &ordered_sd_list);
+	mutex_unlock(&ordered_sd_mtx);
 	return __msm_sd_register_subdev(&msm_subdev->sd);
 }
 EXPORT_SYMBOL(msm_sd_register);
@@ -726,6 +729,15 @@ static long msm_private_ioctl(struct file *file, void *fh,
 		return -EINVAL;
 
 	memset(&event, 0, sizeof(struct v4l2_event));
+	switch (cmd) {
+	case MSM_CAM_V4L2_IOCTL_NOTIFY:
+	case MSM_CAM_V4L2_IOCTL_CMD_ACK:
+	case MSM_CAM_V4L2_IOCTL_NOTIFY_ERROR:
+		break;
+	default:
+		return -ENOTTY;
+	}
+
 	session_id = event_data->session_id;
 	stream_id = event_data->stream_id;
 
@@ -793,11 +805,13 @@ static long msm_private_ioctl(struct file *file, void *fh,
 				__func__);
 		}
 
+		mutex_lock(&ordered_sd_mtx);
 		if (!list_empty(&msm_v4l2_dev->subdevs)) {
 			list_for_each_entry(msm_sd, &ordered_sd_list, list)
 				__msm_sd_notify_freeze_subdevs(msm_sd,
 					event_data->status);
 		}
+		mutex_unlock(&ordered_sd_mtx);
 	}
 		break;
 
@@ -982,9 +996,11 @@ static int msm_close(struct file *filep)
 	struct msm_sd_subdev *msm_sd;
 
 	/*stop all hardware blocks immediately*/
+	mutex_lock(&ordered_sd_mtx);
 	if (!list_empty(&msm_v4l2_dev->subdevs))
 		list_for_each_entry(msm_sd, &ordered_sd_list, list)
 			__msm_sd_close_subdevs(msm_sd, &sd_close);
+	mutex_unlock(&ordered_sd_mtx);
 
 	/* remove msm_v4l2_pm_qos_request */
 	msm_pm_qos_remove_request();
@@ -1030,10 +1046,8 @@ static int msm_open(struct file *filep)
 	BUG_ON(!pvdev);
 
 	/* !!! only ONE open is allowed !!! */
-	if (atomic_read(&pvdev->opened))
+	if (atomic_cmpxchg(&pvdev->opened, 0, 1))
 		return -EBUSY;
-
-	atomic_set(&pvdev->opened, 1);
 
 	spin_lock_irqsave(&msm_pid_lock, flags);
 	msm_pid = get_pid(task_pid(current));
@@ -1342,6 +1356,7 @@ static int msm_probe(struct platform_device *pdev)
 	msm_init_queue(msm_session_q);
 	spin_lock_init(&msm_eventq_lock);
 	spin_lock_init(&msm_pid_lock);
+	mutex_init(&ordered_sd_mtx);
 	INIT_LIST_HEAD(&ordered_sd_list);
 
 	cam_debugfs_root = debugfs_create_dir(MSM_CAM_LOGSYNC_FILE_BASEDIR,
