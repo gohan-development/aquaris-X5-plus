@@ -156,6 +156,7 @@ struct fastrpc_chan_ctx {
 	struct kref kref;
 	struct notifier_block nb;
 	int ssrcount;
+	int prevssrcount;
 };
 
 struct fastrpc_apps {
@@ -456,9 +457,9 @@ static int overlap_ptr_cmp(const void *a, const void *b)
 	return st == 0 ? ed : st;
 }
 
-static void context_build_overlap(struct smq_invoke_ctx *ctx)
+static int context_build_overlap(struct smq_invoke_ctx *ctx)
 {
-	int i;
+	int i, err = 0;
 	remote_arg_t *lpra = ctx->lpra;
 	int inbufs = REMOTE_SCALARS_INBUFS(ctx->sc);
 	int outbufs = REMOTE_SCALARS_OUTBUFS(ctx->sc);
@@ -467,6 +468,11 @@ static void context_build_overlap(struct smq_invoke_ctx *ctx)
 	for (i = 0; i < nbufs; ++i) {
 		ctx->overs[i].start = (uintptr_t)lpra[i].buf.pv;
 		ctx->overs[i].end = ctx->overs[i].start + lpra[i].buf.len;
+		if (lpra[i].buf.len) {
+			VERIFY(err, ctx->overs[i].end > ctx->overs[i].start);
+			if (err)
+				goto bail;
+		}
 		ctx->overs[i].raix = i;
 		ctx->overps[i] = &ctx->overs[i];
 	}
@@ -492,6 +498,8 @@ static void context_build_overlap(struct smq_invoke_ctx *ctx)
 			max = *ctx->overps[i];
 		}
 	}
+bail:
+	return err;
 }
 
 #define K_COPY_FROM_USER(err, kernel, dst, src, size) \
@@ -556,8 +564,11 @@ static int context_alloc(struct fastrpc_file *fl, uint32_t kernel,
 			goto bail;
 	}
 	ctx->sc = invoke->sc;
-	if (bufs)
-		context_build_overlap(ctx);
+	if (bufs) {
+		VERIFY(err, 0 == context_build_overlap(ctx));
+		if (err)
+			goto bail;
+	}
 	ctx->retval = -1;
 	ctx->pid = current->pid;
 	ctx->tgid = current->tgid;
@@ -732,6 +743,7 @@ static int get_args(uint32_t kernel, struct smq_invoke_ctx *ctx)
 	/* calculate len requreed for copying */
 	for (oix = 0; oix < inbufs + outbufs; ++oix) {
 		int i = ctx->overps[oix]->raix;
+		uintptr_t mstart, mend;
 		ssize_t len = lpra[i].buf.len;
 		if (!len)
 			continue;
@@ -739,7 +751,15 @@ static int get_args(uint32_t kernel, struct smq_invoke_ctx *ctx)
 			continue;
 		if (ctx->overps[oix]->offset == 0)
 			copylen = ALIGN(copylen, BALIGN);
-		copylen += ctx->overps[oix]->mend - ctx->overps[oix]->mstart;
+		mstart = ctx->overps[oix]->mstart;
+		mend = ctx->overps[oix]->mend;
+		VERIFY(err, (mend - mstart) <= LONG_MAX);
+		if (err)
+			goto bail;
+		copylen += mend - mstart;
+		VERIFY(err, copylen >= 0);
+		if (err)
+			goto bail;
 	}
 	ctx->used = copylen;
 
@@ -798,7 +818,7 @@ static int get_args(uint32_t kernel, struct smq_invoke_ctx *ctx)
 	for (oix = 0; oix < inbufs + outbufs; ++oix) {
 		int i = ctx->overps[oix]->raix;
 		struct fastrpc_mmap *map = ctx->maps[i];
-		int mlen = ctx->overps[oix]->mend - ctx->overps[oix]->mstart;
+		ssize_t mlen = ctx->overps[oix]->mend - ctx->overps[oix]->mstart;
 		uint64_t buf;
 		ssize_t len = lpra[i].buf.len;
 		if (!len)
@@ -1604,8 +1624,13 @@ static int fastrpc_device_open(struct inode *inode, struct file *filp)
 		kref_init(&me->channel[cid].kref);
 		pr_info("'opened /dev/%s c %d %d'\n", gcinfo[cid].name,
 						MAJOR(me->dev_no), cid);
-		if (fastrpc_mmap_remove_ssr(fl))
-			pr_err("ADSPRPC: SSR: Failed to unmap remote heap\n");
+		if (me->channel[cid].ssrcount !=
+				 me->channel[cid].prevssrcount) {
+			if (fastrpc_mmap_remove_ssr(fl))
+				pr_err("ADSPRPC: SSR: Failed to unmap remote heap\n");
+			me->channel[cid].prevssrcount =
+						me->channel[cid].ssrcount;
+		}
 	}
 	spin_lock(&me->hlock);
 	hlist_add_head(&fl->hn, &me->drivers);
@@ -1792,6 +1817,7 @@ static int __init fastrpc_device_init(void)
 		if (err)
 			goto device_create_bail;
 		me->channel[i].ssrcount = 0;
+		me->channel[i].prevssrcount = 0;
 		me->channel[i].nb.notifier_call = fastrpc_restart_notifier_cb,
 		(void)subsys_notif_register_notifier(gcinfo[i].subsys,
 							&me->channel[i].nb);
