@@ -1,72 +1,84 @@
 /*
- * sh7724 MMCIF loader
+ *  linux/arch/sh/boot/romimage/head.S
  *
- * Copyright (C) 2010 Magnus Damm
- *
- * This file is subject to the terms and conditions of the GNU General Public
- * License.  See the file "COPYING" in the main directory of this archive
- * for more details.
+ * Board specific setup code, executed before zImage loader
  */
 
-#include <linux/mmc/sh_mmcif.h>
-#include <linux/mmc/boot.h>
+.text
+	#include <asm/page.h>
+
+	.global	romstart
+romstart:
+	/* include board specific setup code */
 #include <mach/romimage.h>
 
-#define MMCIF_BASE      (void __iomem *)0xa4ca0000
+#ifdef CONFIG_ROMIMAGE_MMCIF
+	/* load the romImage to above the empty zero page */
+	mov.l	empty_zero_page_dst, r4
+	mov.l	empty_zero_page_dst_adj, r5
+	add	r5, r4
+	mov.l	bytes_to_load, r5
+	mov.l	loader_function, r7
+	jsr	@r7
+	 mov	r4, r15
 
-#define MSTPCR2		0xa4150038
-#define PTWCR		0xa4050146
-#define PTXCR		0xa4050148
-#define PSELA		0xa405014e
-#define PSELE		0xa4050156
-#define HIZCRC		0xa405015c
-#define DRVCRA		0xa405018a
+	mov.l	empty_zero_page_dst, r4
+	mov.l	empty_zero_page_dst_adj, r5
+	add	r5, r4
+	mov.l	loaded_code_offs, r5
+	add	r5, r4
+	jmp	@r4
+	 nop
 
-/* SH7724 specific MMCIF loader
- *
- * loads the romImage from an MMC card starting from block 512
- * use the following line to write the romImage to an MMC card
- * # dd if=arch/sh/boot/romImage of=/dev/sdx bs=512 seek=512
- */
-asmlinkage void mmcif_loader(unsigned char *buf, unsigned long no_bytes)
-{
-	mmcif_update_progress(MMC_PROGRESS_ENTER);
+	.balign 4
+empty_zero_page_dst_adj:
+	.long	PAGE_SIZE
+bytes_to_load:
+	.long	end_data - romstart
+loader_function:
+	.long	mmcif_loader
+loaded_code_offs:
+	.long	loaded_code - romstart
+loaded_code:
+#endif /* CONFIG_ROMIMAGE_MMCIF */
 
-	/* enable clock to the MMCIF hardware block */
-	__raw_writel(__raw_readl(MSTPCR2) & ~0x20000000, MSTPCR2);
+	/* copy the empty_zero_page contents to where vmlinux expects it */
+	mova	extra_data_pos, r0
+	mov.l	extra_data_size, r1
+	add	r1, r0
+	mov.l	empty_zero_page_dst, r1
+	mov	#(PAGE_SHIFT - 4), r4
+	mov	#1, r3
+	shld	r4, r3 /* r3 = PAGE_SIZE / 16 */
 
-	/* setup pins D7-D0 */
-	__raw_writew(0x0000, PTWCR);
+1:
+	mov.l	@r0, r4
+	mov.l	@(4, r0), r5
+	mov.l	@(8, r0), r6
+	mov.l	@(12, r0), r7
+	add	#16,r0
+	mov.l	r4, @r1
+	mov.l	r5, @(4, r1)
+	mov.l	r6, @(8, r1)
+	mov.l	r7, @(12, r1)
+	dt	r3
+	add	#16,r1
+	bf	1b
 
-	/* setup pins MMC_CLK, MMC_CMD */
-	__raw_writew(__raw_readw(PTXCR) & ~0x000f, PTXCR);
+	/* jump to the zImage entry point located after the zero page data */
+	mov	#PAGE_SHIFT, r4
+	mov	#1, r1
+	shld	r4, r1
+	mova	extra_data_pos, r0
+	add	r1, r0
+	mov.l	extra_data_size, r1
+	add	r1, r0
+	jmp	@r0
+	 nop
 
-	/* select D3-D0 pin function */
-	__raw_writew(__raw_readw(PSELA) & ~0x2000, PSELA);
-
-	/* select D7-D4 pin function */
-	__raw_writew(__raw_readw(PSELE) & ~0x3000, PSELE);
-
-	/* disable Hi-Z for the MMC pins */
-	__raw_writew(__raw_readw(HIZCRC) & ~0x0620, HIZCRC);
-
-	/* high drive capability for MMC pins */
-	__raw_writew(__raw_readw(DRVCRA) | 0x3000, DRVCRA);
-
-	mmcif_update_progress(MMC_PROGRESS_INIT);
-
-	/* setup MMCIF hardware */
-	sh_mmcif_boot_init(MMCIF_BASE);
-
-	mmcif_update_progress(MMC_PROGRESS_LOAD);
-
-	/* load kernel via MMCIF interface */
-	sh_mmcif_boot_do_read(MMCIF_BASE, 512,
-	                      (no_bytes + SH_MMCIF_BBS - 1) / SH_MMCIF_BBS,
-			      buf);
-
-	/* disable clock to the MMCIF hardware block */
-	__raw_writel(__raw_readl(MSTPCR2) | 0x20000000, MSTPCR2);
-
-	mmcif_update_progress(MMC_PROGRESS_DONE);
-}
+	.align 2
+empty_zero_page_dst:
+	.long	_text
+extra_data_pos:
+extra_data_size:
+	.long	zero_page_pos - extra_data_pos
