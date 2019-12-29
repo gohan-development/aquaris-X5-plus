@@ -91,9 +91,3 @@ extra_certificates
 signing_key.priv
 signing_key.x509
 x509.genkey
-
-#
-# Kernel script generated files
-#
-KERNEL_OUT
-kernel_log.txt
