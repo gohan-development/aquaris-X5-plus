@@ -1,6 +1,5 @@
 /*
  * Copyright (c) 2012-2018 The Linux Foundation. All rights reserved.
- * Copyright (c) 2018 The LineageOS Project
  *
  * Previously licensed under the ISC license by Qualcomm Atheros, Inc.
  *
@@ -121,7 +120,6 @@ int wlan_hdd_ftm_start(hdd_context_t *pAdapter);
 #endif
 #include "wlan_hdd_debugfs.h"
 #include "sapInternal.h"
-#include "wlan_hdd_request_manager.h"
 
 #ifdef MODULE
 #define WLAN_MODULE_NAME  module_name(THIS_MODULE)
@@ -152,6 +150,7 @@ static struct kparam_string fwpath = {
 static char *country_code;
 static int   enable_11d = -1;
 static int   enable_dfs_chan_scan = -1;
+static int   gbcnMissRate = -1;
 
 #ifndef MODULE
 static int wlan_hdd_inited;
@@ -2667,86 +2666,106 @@ hdd_parse_reassoc(hdd_adapter_t *pAdapter, const char *command, int total_len)
 }
 #endif  /* WLAN_FEATURE_VOWIFI_11R || FEATURE_WLAN_ESE FEATURE_WLAN_LFR */
 
-struct bcn_miss_rate_priv {
-	int bcn_miss_rate;
-};
-
-/**
- * get_bcn_miss_rate_cb() callback invoked on receiving beacon miss
- * rate from firmware
- * @status: Status of get beacon miss rate operation
- * @bcnMissRate: Beacon miss rate
- * @context: Context passed while registering callback
- *
- * This function is invoked by WDA layer on receiving
- * WDI_GET_BCN_MISS_RATE_RSP
- *
- * Return: None
- */
-static void get_bcn_miss_rate_cb(VOS_STATUS status, int bcnMissRate,
-				 void *context)
+static void getBcnMissRateCB(VOS_STATUS status, int bcnMissRate, void *data)
 {
-	struct hdd_request *request;
-	struct bcn_miss_rate_priv *priv;
+    bcnMissRateContext_t *pCBCtx;
 
-	request = hdd_request_get(context);
-	if (!request) {
-		hddLog(VOS_TRACE_LEVEL_ERROR, FL("Obsolete request"));
-		return;
-	}
+    if (NULL == data)
+    {
+        hddLog(VOS_TRACE_LEVEL_ERROR, FL("argument data is NULL"));
+        return;
+    }
 
-	priv = hdd_request_priv(request);
+   /* there is a race condition that exists between this callback
+      function and the caller since the caller could time out either
+      before or while this code is executing.  we use a spinlock to
+      serialize these actions */
+    spin_lock(&hdd_context_lock);
 
-	if (VOS_STATUS_SUCCESS == status)
-		priv->bcn_miss_rate = bcnMissRate;
-	else
-		hddLog(VOS_TRACE_LEVEL_ERROR, FL("failed to get bcnMissRate"));
+    pCBCtx = (bcnMissRateContext_t *)data;
+    gbcnMissRate = -1;
 
-	hdd_request_complete(request);
-	hdd_request_put(request);
+    if (pCBCtx->magic != BCN_MISS_RATE_CONTEXT_MAGIC)
+    {
+        hddLog(VOS_TRACE_LEVEL_ERROR,
+               FL("invalid context magic: %08x"), pCBCtx->magic);
+        spin_unlock(&hdd_context_lock);
+        return ;
+    }
 
-	return;
+    if (VOS_STATUS_SUCCESS == status)
+    {
+        gbcnMissRate = bcnMissRate;
+    }
+    else
+    {
+        hddLog(VOS_TRACE_LEVEL_ERROR, FL("failed to get bcnMissRate"));
+    }
+
+    complete(&(pCBCtx->completion));
+    spin_unlock(&hdd_context_lock);
+
+    return;
 }
 
-struct fw_stats_priv {
-	tSirFwStatsResult *fw_stats;
-};
-
-/**
- * hdd_fw_stats_cb() callback invoked on receiving firmware stats
- * from firmware
- * @status: Status of get firmware stats operation
- * @fwStatsResult: firmware stats
- * @context: Context passed while registering callback
- *
- * This function is invoked by WDA layer on receiving
- * WDI_GET_FW_STATS_RSP
- *
- * Return: None
- */
-static void hdd_fw_stats_cb(VOS_STATUS status,
-     tSirFwStatsResult *fwStatsResult, void *context)
+void hdd_FWStatisCB( VOS_STATUS status,
+     tSirFwStatsResult *fwStatsResult, void *pContext )
 {
-	struct hdd_request *request;
-	struct fw_stats_priv *priv;
+    fwStatsContext_t *fwStatsCtx;
+    hdd_adapter_t *pAdapter;
 
-	hddLog(VOS_TRACE_LEVEL_INFO, FL("with status = %d"),status);
+    hddLog(VOS_TRACE_LEVEL_INFO, FL(" with status = %d"),status);
 
-	request = hdd_request_get(context);
-	if (!request) {
-		hddLog(VOS_TRACE_LEVEL_ERROR, FL("Obsolete request"));
-		return;
-	}
-	priv = hdd_request_priv(request);
-
-	if (VOS_STATUS_SUCCESS == status)
-		*priv->fw_stats = *fwStatsResult;
-	else
-		priv->fw_stats = NULL;
-
-	hdd_request_complete(request);
-	hdd_request_put(request);
-	return;
+    if (NULL == pContext)
+    {
+        hddLog(VOS_TRACE_LEVEL_ERROR, FL("argument data is NULL"));
+        return;
+    }
+    /* there is a race condition that exists between this callback
+       function and the caller since the caller could time out either
+       before or while this code is executing.  we use a spinlock to
+       serialize these actions */
+    spin_lock(&hdd_context_lock);
+    fwStatsCtx = (fwStatsContext_t *) pContext;
+    if (fwStatsCtx->magic != FW_STATS_CONTEXT_MAGIC)
+    {
+        hddLog(VOS_TRACE_LEVEL_ERROR,
+               FL("invalid context magic: %08x"), fwStatsCtx->magic);
+        spin_unlock(&hdd_context_lock);
+        return;
+    }
+    pAdapter = fwStatsCtx->pAdapter;
+    if ((NULL == pAdapter) || (WLAN_HDD_ADAPTER_MAGIC != pAdapter->magic))
+    {
+        hddLog(VOS_TRACE_LEVEL_ERROR,
+              FL("pAdapter returned is NULL or invalid"));
+        spin_unlock(&hdd_context_lock);
+        return;
+    }
+    pAdapter->fwStatsRsp.type = 0;
+    if ((VOS_STATUS_SUCCESS == status) && (NULL != fwStatsResult))
+    {
+        switch( fwStatsResult->type )
+        {
+            case FW_UBSP_STATS:
+            {
+                 memcpy(&pAdapter->fwStatsRsp,fwStatsResult,sizeof(tSirFwStatsResult));
+                 hddLog(VOS_TRACE_LEVEL_INFO,
+                  FL("ubsp_enter_cnt = %d ubsp_jump_ddr_cnt = %d"),
+                  pAdapter->fwStatsRsp.fwStatsData.ubspStats.ubsp_enter_cnt,
+                  pAdapter->fwStatsRsp.fwStatsData.ubspStats.ubsp_jump_ddr_cnt);
+            }
+            break;
+            default:
+            {
+                   hddLog(VOS_TRACE_LEVEL_ERROR,
+                    FL(" No handling for stats type %d"),fwStatsResult->type);
+            }
+         }
+    }
+    complete(&(fwStatsCtx->completion));
+    spin_unlock(&hdd_context_lock);
+    return;
 }
 
 /*
@@ -5968,13 +5987,8 @@ static int hdd_driver_command(hdd_adapter_t *pAdapter,
        {
            eHalStatus status;
            char buf[32], len;
-           void *cookie;
-           struct hdd_request *request;
-           struct bcn_miss_rate_priv *priv;
-           static const struct hdd_request_params params = {
-               .priv_size = sizeof(*priv),
-               .timeout_ms = WLAN_WAIT_TIME_STATS,
-           };
+           long waitRet;
+           bcnMissRateContext_t getBcnMissRateCtx;
 
            hdd_station_ctx_t *pHddStaCtx = WLAN_HDD_GET_STATION_CTX_PTR(pAdapter);
 
@@ -5985,59 +5999,49 @@ static int hdd_driver_command(hdd_adapter_t *pAdapter,
                ret = -1;
                goto exit;
            }
-           request = hdd_request_alloc(&params);
-           if (!request) {
-               hddLog(VOS_TRACE_LEVEL_ERROR, FL("Request allocation failure"));
-               ret = -ENOMEM;
-               goto exit;
-           }
-           cookie = hdd_request_cookie(request);
-           priv = hdd_request_priv(request);
-           priv->bcn_miss_rate = -1;
+
+           init_completion(&(getBcnMissRateCtx.completion));
+           getBcnMissRateCtx.magic = BCN_MISS_RATE_CONTEXT_MAGIC;
 
            status = sme_getBcnMissRate((tHalHandle)(pHddCtx->hHal),
                                        pAdapter->sessionId,
-                                       (void *)get_bcn_miss_rate_cb,
-                                       cookie);
+                                       (void *)getBcnMissRateCB,
+                                       (void *)(&getBcnMissRateCtx));
            if( eHAL_STATUS_SUCCESS != status)
            {
                hddLog(VOS_TRACE_LEVEL_INFO,
                     FL("GETBCNMISSRATE: fail to post WDA cmd"));
                 ret = -EINVAL;
-                goto free_bcn_miss_rate_req;
+                goto exit;
            }
 
-           ret = hdd_request_wait_for_response(request);
-           if(ret)
+           waitRet = wait_for_completion_interruptible_timeout
+                           (&getBcnMissRateCtx.completion, BCN_MISS_RATE_TIME);
+           if(waitRet <= 0)
            {
                hddLog(VOS_TRACE_LEVEL_ERROR,
                          FL("failed to wait on bcnMissRateComp %d"), ret);
 
+               //Make magic number to zero so that callback is not called.
+               spin_lock(&hdd_context_lock);
+               getBcnMissRateCtx.magic = 0x0;
+               spin_unlock(&hdd_context_lock);
                ret = -EINVAL;
-               goto free_bcn_miss_rate_req;
+               goto exit;
            }
 
            hddLog(VOS_TRACE_LEVEL_INFO,
-                  FL("GETBCNMISSRATE: bcnMissRate: %d"), priv->bcn_miss_rate);
+                  FL("GETBCNMISSRATE: bcnMissRate: %d"), gbcnMissRate);
 
-           if (priv->bcn_miss_rate == -1) {
-               ret = -EFAULT;
-               goto free_bcn_miss_rate_req;
-           }
-
-           len = snprintf(buf, sizeof(buf), "GETBCNMISSRATE %d",
-                          priv->bcn_miss_rate);
+           len = snprintf(buf, sizeof(buf), "GETBCNMISSRATE %d", gbcnMissRate);
            if (copy_to_user(priv_data.buf, &buf, len + 1))
            {
                hddLog(VOS_TRACE_LEVEL_ERROR,
                      "%s: failed to copy data to user buffer", __func__);
                ret = -EFAULT;
-               goto free_bcn_miss_rate_req;
+               goto exit;
            }
            ret = len;
-
-free_bcn_miss_rate_req:
-           hdd_request_put(request);
        }
 #ifdef FEATURE_WLAN_TDLS
        else if (strncmp(command, "TDLSSECONDARYCHANNELOFFSET", 26) == 0) {
@@ -6127,17 +6131,11 @@ free_bcn_miss_rate_req:
            eHalStatus status;
            char *buf = NULL;
            char len;
-           tSirFwStatsResult *fwStatsRsp = &(pAdapter->fwStatsRsp),
-                             *fw_stats_result;
+           long waitRet;
+           fwStatsContext_t fwStatsCtx;
+           tSirFwStatsResult *fwStatsRsp = &(pAdapter->fwStatsRsp);
            tANI_U8 *ptr = command;
            int stats;
-           void *cookie;
-           struct hdd_request *request;
-           struct fw_stats_priv *priv;
-           static const struct hdd_request_params params = {
-               .priv_size = sizeof(*priv),
-               .timeout_ms = WLAN_WAIT_TIME_STATS,
-           };
 
            ret = hdd_drv_cmd_validate(command, 10);
            if (ret)
@@ -6161,64 +6159,32 @@ free_bcn_miss_rate_req:
                goto exit;
            }
 
-           request = hdd_request_alloc(&params);
-           if (!request) {
-               hddLog(VOS_TRACE_LEVEL_ERROR, FL("Request allocation failure"));
-               ret = -ENOMEM;
-               goto exit;
-           }
-           cookie = hdd_request_cookie(request);
-
+           init_completion(&(fwStatsCtx.completion));
+           fwStatsCtx.magic = FW_STATS_CONTEXT_MAGIC;
+           fwStatsCtx.pAdapter = pAdapter;
+           fwStatsRsp->type = 0;
            status = sme_GetFwStats( (tHalHandle)pHddCtx->hHal, stats,
-                                   cookie, hdd_fw_stats_cb);
+                                   &fwStatsCtx, hdd_FWStatisCB);
            if (eHAL_STATUS_SUCCESS != status)
            {
                hddLog(VOS_TRACE_LEVEL_ERROR,
                        FL(" fail to post WDA cmd status = %d"), status);
                ret = -EINVAL;
-               hdd_request_put(request);
                goto exit;
            }
-           ret = hdd_request_wait_for_response(request);
-           if (ret)
+           waitRet = wait_for_completion_timeout
+                             (&(fwStatsCtx.completion), FW_STATE_WAIT_TIME);
+           if (waitRet <= 0)
            {
                hddLog(VOS_TRACE_LEVEL_ERROR,
                         FL("failed to wait on GwtFwstats"));
+               //Make magic number to zero so that callback is not executed.
+               spin_lock(&hdd_context_lock);
+               fwStatsCtx.magic = 0x0;
+               spin_unlock(&hdd_context_lock);
                ret = -EINVAL;
-               hdd_request_put(request);
                goto exit;
            }
-
-           priv = hdd_request_priv(request);
-           fw_stats_result = priv->fw_stats;
-           fwStatsRsp->type = 0;
-           if (NULL != fw_stats_result)
-           {
-               switch (fw_stats_result->type )
-               {
-                   case FW_UBSP_STATS:
-                   {
-                       tSirUbspFwStats *stats =
-                               &fwStatsRsp->fwStatsData.ubspStats;
-                       memcpy(fwStatsRsp, fw_stats_result,
-                              sizeof(tSirFwStatsResult));
-                       hddLog(VOS_TRACE_LEVEL_INFO,
-                              FL("ubsp_enter_cnt = %d ubsp_jump_ddr_cnt = %d"),
-                                 stats->ubsp_enter_cnt,
-                                 stats->ubsp_jump_ddr_cnt);
-                   }
-                   break;
-
-                   default:
-                   {
-                       hddLog(VOS_TRACE_LEVEL_ERROR,
-                              FL("No handling for stats type %d"),
-                                 fw_stats_result->type);
-                   }
-               }
-           }
-           hdd_request_put(request);
-
            if (fwStatsRsp->type)
            {
                buf = kmalloc(FW_STATE_RSP_LEN, GFP_KERNEL);
@@ -6265,6 +6231,7 @@ free_bcn_miss_rate_req:
                ret = -EFAULT;
                goto exit;
            }
+
        }
        else if (strncasecmp(command, "SET_FCC_CHANNEL", 15) == 0)
        {
@@ -6571,32 +6538,62 @@ static VOS_STATUS hdd_parse_ese_beacon_req(tANI_U8 *pValue,
     return VOS_STATUS_SUCCESS;
 }
 
-struct tsm_priv {
-	tAniTrafStrmMetrics tsm_metrics;
-};
-
-static void hdd_get_tsm_stats_cb(tAniTrafStrmMetrics tsm_metrics,
-				 const tANI_U32 sta_id, void *context )
+static void hdd_GetTsmStatsCB( tAniTrafStrmMetrics tsmMetrics, const tANI_U32 staId, void *pContext )
 {
-	struct hdd_request *request;
-	struct tsm_priv *priv;
+   struct statsContext *pStatsContext = NULL;
+   hdd_adapter_t       *pAdapter = NULL;
 
-	ENTER();
+   if (NULL == pContext)
+   {
+      hddLog(VOS_TRACE_LEVEL_ERROR,
+             "%s: Bad param, pContext [%pK]",
+             __func__, pContext);
+      return;
+   }
 
-	request = hdd_request_get(context);
-	if (!request) {
-		hddLog(VOS_TRACE_LEVEL_ERROR, FL("Obsolete request"));
-		return;
-	}
+   /* there is a race condition that exists between this callback
+      function and the caller since the caller could time out either
+      before or while this code is executing.  we use a spinlock to
+      serialize these actions */
+   spin_lock(&hdd_context_lock);
 
-	priv = hdd_request_priv(request);
-	priv->tsm_metrics = tsm_metrics;
+   pStatsContext = pContext;
+   pAdapter      = pStatsContext->pAdapter;
+   if ((NULL == pAdapter) || (STATS_CONTEXT_MAGIC != pStatsContext->magic))
+   {
+      /* the caller presumably timed out so there is nothing we can do */
+      spin_unlock(&hdd_context_lock);
+      hddLog(VOS_TRACE_LEVEL_WARN,
+             "%s: Invalid context, pAdapter [%pK] magic [%08x]",
+              __func__, pAdapter, pStatsContext->magic);
+      return;
+   }
 
-	hdd_request_complete(request);
-	hdd_request_put(request);
+   /* context is valid so caller is still waiting */
 
-	EXIT();
+   /* paranoia: invalidate the magic */
+   pStatsContext->magic = 0;
+
+   /* copy over the tsm stats */
+   pAdapter->tsmStats.UplinkPktQueueDly = tsmMetrics.UplinkPktQueueDly;
+   vos_mem_copy(pAdapter->tsmStats.UplinkPktQueueDlyHist,
+                 tsmMetrics.UplinkPktQueueDlyHist,
+                 sizeof(pAdapter->tsmStats.UplinkPktQueueDlyHist)/
+                 sizeof(pAdapter->tsmStats.UplinkPktQueueDlyHist[0]));
+   pAdapter->tsmStats.UplinkPktTxDly = tsmMetrics.UplinkPktTxDly;
+   pAdapter->tsmStats.UplinkPktLoss = tsmMetrics.UplinkPktLoss;
+   pAdapter->tsmStats.UplinkPktCount = tsmMetrics.UplinkPktCount;
+   pAdapter->tsmStats.RoamingCount = tsmMetrics.RoamingCount;
+   pAdapter->tsmStats.RoamingDly = tsmMetrics.RoamingDly;
+
+   /* notify the caller */
+   complete(&pStatsContext->completion);
+
+   /* serialization is complete */
+   spin_unlock(&hdd_context_lock);
 }
+
+
 
 static VOS_STATUS  hdd_get_tsm_stats(hdd_adapter_t *pAdapter, const tANI_U8 tid,
                                          tAniTrafStrmMetrics* pTsmMetrics)
@@ -6604,15 +6601,9 @@ static VOS_STATUS  hdd_get_tsm_stats(hdd_adapter_t *pAdapter, const tANI_U8 tid,
    hdd_station_ctx_t *pHddStaCtx = NULL;
    eHalStatus         hstatus;
    VOS_STATUS         vstatus = VOS_STATUS_SUCCESS;
+   long               lrc;
+   struct statsContext context;
    hdd_context_t     *pHddCtx = NULL;
-   int ret;
-   void *cookie;
-   struct hdd_request *request;
-   struct tsm_priv *priv;
-   static const struct hdd_request_params params = {
-        .priv_size = sizeof(*priv),
-        .timeout_ms = WLAN_WAIT_TIME_STATS,
-   };
 
    if (NULL == pAdapter)
    {
@@ -6623,18 +6614,16 @@ static VOS_STATUS  hdd_get_tsm_stats(hdd_adapter_t *pAdapter, const tANI_U8 tid,
    pHddCtx = WLAN_HDD_GET_CTX(pAdapter);
    pHddStaCtx = WLAN_HDD_GET_STATION_CTX_PTR(pAdapter);
 
-   request = hdd_request_alloc(&params);
-   if (!request) {
-           hddLog(VOS_TRACE_LEVEL_ERROR, FL("Request allocation failure"));
-           return VOS_STATUS_E_NOMEM;
-   }
-   cookie = hdd_request_cookie(request);
+   /* we are connected prepare our callback context */
+   init_completion(&context.completion);
+   context.pAdapter = pAdapter;
+   context.magic = STATS_CONTEXT_MAGIC;
 
    /* query tsm stats */
-   hstatus = sme_GetTsmStats(pHddCtx->hHal, hdd_get_tsm_stats_cb,
+   hstatus = sme_GetTsmStats(pHddCtx->hHal, hdd_GetTsmStatsCB,
                          pHddStaCtx->conn_info.staId[ 0 ],
                          pHddStaCtx->conn_info.bssId,
-                         cookie, pHddCtx->pvosContext, tid);
+                         &context, pHddCtx->pvosContext, tid);
 
    if (eHAL_STATUS_SUCCESS != hstatus)
    {
@@ -6645,19 +6634,45 @@ static VOS_STATUS  hdd_get_tsm_stats(hdd_adapter_t *pAdapter, const tANI_U8 tid,
    else
    {
       /* request was sent -- wait for the response */
-      ret = hdd_request_wait_for_response(request);
-      if (ret) {
+      lrc = wait_for_completion_interruptible_timeout(&context.completion,
+                                    msecs_to_jiffies(WLAN_WAIT_TIME_STATS));
+      if (lrc <= 0)
+      {
          hddLog(VOS_TRACE_LEVEL_ERROR,
-                "SME timeout while retrieving statistics");
+                "%s: SME %s while retrieving statistics",
+                __func__, (0 == lrc) ? "timeout" : "interrupt");
          vstatus = VOS_STATUS_E_TIMEOUT;
-      } else {
-         priv = hdd_request_priv(request);
-         *pTsmMetrics = priv->tsm_metrics;
       }
    }
 
-   hdd_request_put(request);
+   /* either we never sent a request, we sent a request and received a
+      response or we sent a request and timed out.  if we never sent a
+      request or if we sent a request and got a response, we want to
+      clear the magic out of paranoia.  if we timed out there is a
+      race condition such that the callback function could be
+      executing at the same time we are. of primary concern is if the
+      callback function had already verified the "magic" but had not
+      yet set the completion variable when a timeout occurred. we
+      serialize these activities by invalidating the magic while
+      holding a shared spinlock which will cause us to block if the
+      callback is currently executing */
+   spin_lock(&hdd_context_lock);
+   context.magic = 0;
+   spin_unlock(&hdd_context_lock);
 
+   if (VOS_STATUS_SUCCESS == vstatus)
+   {
+      pTsmMetrics->UplinkPktQueueDly = pAdapter->tsmStats.UplinkPktQueueDly;
+      vos_mem_copy(pTsmMetrics->UplinkPktQueueDlyHist,
+                   pAdapter->tsmStats.UplinkPktQueueDlyHist,
+                   sizeof(pAdapter->tsmStats.UplinkPktQueueDlyHist)/
+                   sizeof(pAdapter->tsmStats.UplinkPktQueueDlyHist[0]));
+      pTsmMetrics->UplinkPktTxDly = pAdapter->tsmStats.UplinkPktTxDly;
+      pTsmMetrics->UplinkPktLoss = pAdapter->tsmStats.UplinkPktLoss;
+      pTsmMetrics->UplinkPktCount = pAdapter->tsmStats.UplinkPktCount;
+      pTsmMetrics->RoamingCount = pAdapter->tsmStats.RoamingCount;
+      pTsmMetrics->RoamingDly = pAdapter->tsmStats.RoamingDly;
+   }
    return vstatus;
 }
 #endif /*FEATURE_WLAN_ESE && FEATURE_WLAN_ESE_UPLOAD */
@@ -8864,20 +8879,22 @@ VOS_STATUS hdd_disable_bmps_imps(hdd_context_t *pHddCtx, tANI_U8 session_type)
    return status;
 }
 
-void hdd_mon_post_msg_cb(void *context)
+void hdd_monPostMsgCb(tANI_U32 *magic, struct completion *cmpVar)
 {
-	struct hdd_request *request;
+    if (magic == NULL || cmpVar == NULL) {
+        VOS_TRACE(VOS_MODULE_ID_HDD, VOS_TRACE_LEVEL_ERROR,
+                  FL("invalid arguments %pK %pK"), magic, cmpVar);
+        return;
+    }
+    if (*magic != MON_MODE_MSG_MAGIC) {
+        VOS_TRACE(VOS_MODULE_ID_HDD, VOS_TRACE_LEVEL_ERROR,
+                  FL("maic: %x"), *magic);
+        return;
+    }
 
-	request = hdd_request_get(context);
-	if (!request) {
-		hddLog(VOS_TRACE_LEVEL_ERROR, FL("Obsolete request"));
-		return;
-	}
-
-	hdd_request_complete(request);
-	hdd_request_put(request);
+    complete(cmpVar);
+    return;
 }
-
 
 void hdd_init_mon_mode (hdd_adapter_t *pAdapter)
  {
@@ -9046,16 +9063,6 @@ hdd_adapter_t* hdd_open_adapter( hdd_context_t *pHddCtx, tANI_U8 session_type,
          netif_carrier_off(pAdapter->dev);
 
          hdd_set_conparam( 1 );
-
-         // Workqueue which gets scheduled in IPv4 notification callback.
-         vos_init_work(&pAdapter->ipv4NotifierWorkQueue,
-                       hdd_ipv4_notifier_work_queue);
-
-#ifdef WLAN_NS_OFFLOAD
-         // Workqueue which gets scheduled in IPv6 notification callback.
-         vos_init_work(&pAdapter->ipv6NotifierWorkQueue,
-                       hdd_ipv6_notifier_work_queue);
-#endif
 
          if (WLAN_HDD_P2P_GO == session_type)
          {
@@ -9336,16 +9343,12 @@ VOS_STATUS hdd_cleanup_ap_events(hdd_adapter_t *adapter)
 
 int wlan_hdd_stop_mon(hdd_context_t *hdd_ctx, bool wait)
 {
-	hdd_adapter_t *adapter;
 	hdd_mon_ctx_t *mon_ctx;
-	void (*func_ptr)(void *context) = NULL;
-	int ret = 0;
-	void *cookie = NULL;
-	struct hdd_request *request;
-	static const struct hdd_request_params params = {
-		.priv_size = 0,
-		.timeout_ms = MON_MODE_MSG_TIMEOUT,
-	};
+	long ret;
+	v_U32_t magic;
+	struct completion cmp_var;
+	void (*func_ptr)(tANI_U32 *magic, struct completion *cmpVar) = NULL;
+	hdd_adapter_t *adapter;
 
 	adapter = hdd_get_adapter(hdd_ctx, WLAN_HDD_MONITOR);
 	if (!adapter) {
@@ -9362,37 +9365,28 @@ int wlan_hdd_stop_mon(hdd_context_t *hdd_ctx, bool wait)
 
 	mon_ctx->state = MON_MODE_STOP;
 	if (wait) {
-		func_ptr = hdd_mon_post_msg_cb;
-		request = hdd_request_alloc(&params);
-		if (!request) {
-			hddLog(VOS_TRACE_LEVEL_ERROR,
-				FL("Request allocation failure"));
-			return -ENOMEM;
-		}
-		cookie = hdd_request_cookie(request);
+		func_ptr = hdd_monPostMsgCb;
+		magic = MON_MODE_MSG_MAGIC;
+		init_completion(&cmp_var);
 	}
 
-	/*
-	 * If func_ptr is NULL, on receiving WDI_MON_START_RSP or
-	 * WDI_MON_STOP_RSP hdd_mon_post_msg_cb() won't be invoked
-	 * and so uninitialized cookie won't be accessed.
-	 */
-	if (VOS_STATUS_SUCCESS != wlan_hdd_mon_postMsg(cookie,
+	if (VOS_STATUS_SUCCESS != wlan_hdd_mon_postMsg(&magic, &cmp_var,
 						       mon_ctx,
-						       func_ptr)) {
+						       hdd_monPostMsgCb)) {
 		hddLog(LOGE, FL("failed to stop MON MODE"));
-		ret =  -EINVAL;
+		mon_ctx->state = MON_MODE_START;
+		magic = 0;
+		return -EINVAL;
 	}
 
 	if (!wait)
 		goto bmps_roaming;
 
-	if (!ret)
-		ret = hdd_request_wait_for_response(request);
-	hdd_request_put(request);
-	if (ret) {
+	ret = wait_for_completion_timeout(&cmp_var, MON_MODE_MSG_TIMEOUT);
+	magic = 0;
+	if (ret <= 0 ) {
 		hddLog(LOGE,
-			FL("timeout on stop monitor mode completion %d"), ret);
+			FL("timeout on stop monitor mode completion %ld"), ret);
 		return -EINVAL;
 	}
 
@@ -9730,12 +9724,6 @@ VOS_STATUS hdd_stop_adapter( hdd_context_t *pHddCtx, hdd_adapter_t *pAdapter,
             pAdapter->sessionCtx.ap.beacon = NULL;
          }
          mutex_unlock(&pHddCtx->sap_lock);
-
-#ifdef WLAN_NS_OFFLOAD
-         vos_flush_work(&pAdapter->ipv6NotifierWorkQueue);
-#endif
-         vos_flush_work(&pAdapter->ipv4NotifierWorkQueue);
-
          break;
 
       case WLAN_HDD_MONITOR:
@@ -11094,8 +11082,8 @@ void wlan_hdd_mon_set_typesubtype( hdd_mon_ctx_t *pMonCtx,int type)
      pMonCtx->typeSubtypeBitmap |= 0xFFFF00000000;
 }
 
-VOS_STATUS wlan_hdd_mon_postMsg(void *context, hdd_mon_ctx_t *pMonCtx,
-                                void* callback)
+VOS_STATUS wlan_hdd_mon_postMsg(tANI_U32 *magic, struct completion *cmpVar,
+                                hdd_mon_ctx_t *pMonCtx , void* callback)
 {
     vos_msg_t    monMsg;
     tSirMonModeReq *pMonModeReq;
@@ -11117,7 +11105,8 @@ VOS_STATUS wlan_hdd_mon_postMsg(void *context, hdd_mon_ctx_t *pMonCtx,
         return VOS_STATUS_E_FAILURE;
     }
 
-    pMonModeReq->context = context;
+    pMonModeReq->magic = magic;
+    pMonModeReq->cmpVar = cmpVar;
     pMonModeReq->data = pMonCtx;
     pMonModeReq->callback = callback;
 
@@ -11137,14 +11126,10 @@ void wlan_hdd_mon_close(hdd_context_t *pHddCtx)
 {
     VOS_STATUS vosStatus;
     v_CONTEXT_t pVosContext = pHddCtx->pvosContext;
+    long ret;
     hdd_mon_ctx_t *pMonCtx = NULL;
-    int ret;
-    void *cookie;
-    struct hdd_request *request;
-    static const struct hdd_request_params params = {
-        .priv_size = 0,
-        .timeout_ms = MON_MODE_MSG_TIMEOUT,
-    };
+    v_U32_t magic;
+    struct completion cmpVar;
 
     hdd_adapter_t *pAdapter = hdd_get_adapter(pHddCtx,WLAN_HDD_MONITOR);
     if(pAdapter == NULL || pVosContext == NULL)
@@ -11156,29 +11141,23 @@ void wlan_hdd_mon_close(hdd_context_t *pHddCtx)
     pMonCtx =  WLAN_HDD_GET_MONITOR_CTX_PTR(pAdapter);
     if (pMonCtx!= NULL && pMonCtx->state == MON_MODE_START) {
         pMonCtx->state = MON_MODE_STOP;
-        request = hdd_request_alloc(&params);
-        if (!request) {
-            hddLog(VOS_TRACE_LEVEL_ERROR, FL("Request allocation failure"));
-            return;
-        }
-        cookie = hdd_request_cookie(request);
-
+        magic = MON_MODE_MSG_MAGIC;
+        init_completion(&cmpVar);
         if (VOS_STATUS_SUCCESS !=
-                      wlan_hdd_mon_postMsg(cookie, pMonCtx,
-                                           hdd_mon_post_msg_cb)) {
+                      wlan_hdd_mon_postMsg(&magic, &cmpVar,
+                                            pMonCtx, hdd_monPostMsgCb)) {
              VOS_TRACE(VOS_MODULE_ID_HDD, VOS_TRACE_LEVEL_ERROR,
                        FL("failed to post MON MODE REQ"));
              pMonCtx->state = MON_MODE_START;
-             goto req_put;
+             magic = 0;
+             return;
         }
-
-        ret = hdd_request_wait_for_response(request);
-        if (ret)
+        ret = wait_for_completion_timeout(&cmpVar, MON_MODE_MSG_TIMEOUT);
+        magic = 0;
+        if (ret <= 0 ) {
             VOS_TRACE(VOS_MODULE_ID_HDD, VOS_TRACE_LEVEL_ERROR,
-                    FL("timeout on monitor mode completion %d"), ret);
-
-req_put:
-        hdd_request_put(request);
+                    FL("timeout on monitor mode completion %ld"), ret);
+        }
     }
 
    hdd_UnregisterWext(pAdapter->dev);
@@ -11601,8 +11580,6 @@ free_hdd_ctx:
        kfree(pHddCtx->cfg_ini);
        pHddCtx->cfg_ini= NULL;
    }
-
-   hdd_request_manager_deinit();
 
    /* FTM/MONITOR mode, WIPHY did not registered
       If un-register here, system crash will happen */
@@ -12611,8 +12588,6 @@ int hdd_wlan_startup(struct device *dev )
       goto err_free_hdd_context;
    }
 
-   hdd_request_manager_init();
-
    vos_mem_zero(pHddCtx->cfg_ini, sizeof( hdd_config_t ));
 
    // Read and parse the qcom_cfg.ini file
@@ -12911,22 +12886,6 @@ int hdd_wlan_startup(struct device *dev )
    }
    {
       eHalStatus halStatus;
-
-      /* Overwrite the Mac address if config file exist */
-      if (VOS_STATUS_SUCCESS != hdd_update_mac_config(pHddCtx))
-      {
-         hddLog(VOS_TRACE_LEVEL_WARN,
-                "%s: Didn't overwrite MAC from config file",
-                __func__);
-      } else {
-         pr_info("%s: WLAN Mac Addr from config: %02X:%02X:%02X:%02X:%02X:%02X\n", WLAN_MODULE_NAME,
-                 pHddCtx->cfg_ini->intfMacAddr[0].bytes[0],
-                 pHddCtx->cfg_ini->intfMacAddr[0].bytes[1],
-                 pHddCtx->cfg_ini->intfMacAddr[0].bytes[2],
-                 pHddCtx->cfg_ini->intfMacAddr[0].bytes[3],
-                 pHddCtx->cfg_ini->intfMacAddr[0].bytes[4],
-                 pHddCtx->cfg_ini->intfMacAddr[0].bytes[5]);
-      }
 
       /* Set the MAC Address Currently this is used by HAL to
        * add self sta. Remove this once self sta is added as
@@ -13509,7 +13468,6 @@ err_wdclose:
       vos_watchdog_close(pVosContext);
 
 err_config:
-   hdd_request_manager_deinit();
    kfree(pHddCtx->cfg_ini);
    pHddCtx->cfg_ini= NULL;
 
@@ -14892,8 +14850,6 @@ void hdd_indicate_mgmt_frame(tSirSmeMgmtFrameInd *frame_ind)
    hdd_context_t *hdd_ctx = NULL;
    hdd_adapter_t *adapter = NULL;
    v_CONTEXT_t vos_context = NULL;
-   struct ieee80211_mgmt *mgmt =
-          (struct ieee80211_mgmt *)frame_ind->frameBuf;
 
    /* Get the global VOSS context.*/
    vos_context = vos_get_global_context(VOS_MODULE_ID_SYS, NULL);
@@ -14909,12 +14865,6 @@ void hdd_indicate_mgmt_frame(tSirSmeMgmtFrameInd *frame_ind)
    {
        return;
    }
-
-   if (frame_ind->frameLen < ieee80211_hdrlen(mgmt->frame_control)) {
-          hddLog(LOGE, FL(" Invalid frame length"));
-          return;
-   }
-
    adapter = hdd_get_adapter_by_sme_session_id(hdd_ctx,
                                           frame_ind->sessionId);
 
@@ -15421,10 +15371,6 @@ static const struct file_operations memdump_fops = {
     read: memdump_read
 };
 
-struct fw_mem_dump_priv {
-	uint32_t status;
-};
-
 /*
 * wlan_hdd_fw_mem_dump_cb : callback for Fw mem dump request
 * To be passed by HDD to WDA and called upon receiving of response
@@ -15433,42 +15379,34 @@ struct fw_mem_dump_priv {
 * @dump_rsp : dump response from HAL
 * Returns none
 */
-void wlan_hdd_fw_mem_dump_cb(void *context,
+void wlan_hdd_fw_mem_dump_cb(void *fwMemDumpReqContext,
                          tAniFwrDumpRsp *dump_rsp)
 {
-	struct hdd_request *request;
-	struct fw_mem_dump_priv *priv;
+    struct hdd_fw_mem_dump_req_ctx *pHddFwMemDumpCtx = (struct hdd_fw_mem_dump_req_ctx *)fwMemDumpReqContext;
 
-	request = hdd_request_get(context);
-	if (!request) {
-		hddLog(VOS_TRACE_LEVEL_ERROR, FL("Obsolete request"));
-		return;
-	}
+    ENTER();
+    spin_lock(&hdd_context_lock);
+    if(!pHddFwMemDumpCtx || (FW_MEM_DUMP_MAGIC != pHddFwMemDumpCtx->magic)) {
+       spin_unlock(&hdd_context_lock);
+       return;
+    }
+    /* report the status to requesting function and free mem.*/
+    if (dump_rsp->dump_status != eHAL_STATUS_SUCCESS) {
+       hddLog(LOGE, FL("fw dump request declined by fwr"));
+       //set the request completion variable
+       complete(&(pHddFwMemDumpCtx->req_completion));
+       //Free the allocated fwr dump
+       wlan_free_fwr_mem_dump_buffer();
+       wlan_set_fwr_mem_dump_state(FW_MEM_DUMP_IDLE);
+    }
+    else {
+       hddLog(LOG1, FL("fw dump request accepted by fwr"));
+       /* register the HDD callback which will be called by SVC */
+       wlan_set_svc_fw_mem_dump_req_cb((void*)wlan_hdd_fw_mem_dump_req_cb,(void*)pHddFwMemDumpCtx);
+    }
+    spin_unlock(&hdd_context_lock);
+    EXIT();
 
-	ENTER();
-
-	priv = hdd_request_priv(request);
-	priv->status = dump_rsp->dump_status;
-
-	/* report the status to requesting function and free mem.*/
-	if (dump_rsp->dump_status != eHAL_STATUS_SUCCESS) {
-		hddLog(LOGE, FL("fw dump request declined by fwr"));
-		//set the request completion variable
-		hdd_request_complete(request);
-		//Free the allocated fwr dump
-		wlan_free_fwr_mem_dump_buffer();
-		wlan_set_fwr_mem_dump_state(FW_MEM_DUMP_IDLE);
-	} else {
-		hddLog(LOG1, FL("fw dump request accepted by fwr"));
-		/* register the HDD callback which will be called by SVC */
-		wlan_set_svc_fw_mem_dump_req_cb(
-					(void*)wlan_hdd_fw_mem_dump_req_cb,
-					context);
-	}
-
-	hdd_request_put(request);
-
-	EXIT();
 }
 
 /**
@@ -15603,16 +15541,9 @@ int memdump_deinit(void)
 int wlan_hdd_fw_mem_dump_req(hdd_context_t * pHddCtx)
 {
    tAniFwrDumpReq fw_mem_dump_req={0};
+   struct hdd_fw_mem_dump_req_ctx fw_mem_dump_ctx;
    eHalStatus status = eHAL_STATUS_FAILURE;
-   int ret=0, dump_status;
-   void *cookie;
-   struct hdd_request *request;
-   struct fw_mem_dump_priv *priv;
-   static const struct hdd_request_params params = {
-       .priv_size = sizeof(*priv),
-       .timeout_ms = FW_MEM_DUMP_TIMEOUT_MS,
-   };
-
+   int ret=0, result;
    ENTER();
 
    /*Check whether a dump request is already going on
@@ -15632,16 +15563,12 @@ int wlan_hdd_fw_mem_dump_req(hdd_context_t * pHddCtx)
        hddLog(LOGE, FL("Fwr mem Allocation failed"));
        return -ENOMEM;
    }
-
-   request = hdd_request_alloc(&params);
-   if (!request) {
-        hddLog(VOS_TRACE_LEVEL_ERROR, FL("Request allocation failure"));
-        return VOS_STATUS_E_NOMEM;
-   }
-   cookie = hdd_request_cookie(request);
+   init_completion(&fw_mem_dump_ctx.req_completion);
+   fw_mem_dump_ctx.magic = FW_MEM_DUMP_MAGIC;
+   fw_mem_dump_ctx.status = false;
 
    fw_mem_dump_req.fwMemDumpReqCallback = wlan_hdd_fw_mem_dump_cb;
-   fw_mem_dump_req.fwMemDumpReqContext = cookie;
+   fw_mem_dump_req.fwMemDumpReqContext = &fw_mem_dump_ctx;
    status = sme_FwMemDumpReq(pHddCtx->hHal, &fw_mem_dump_req);
    if(eHAL_STATUS_SUCCESS != status)
    {
@@ -15652,20 +15579,21 @@ int wlan_hdd_fw_mem_dump_req(hdd_context_t * pHddCtx)
        goto cleanup;
    }
    /*wait for fw mem dump completion to send event to userspace*/
-   ret = hdd_request_wait_for_response(request);
-   if (ret)
+   result =
+     wait_for_completion_timeout(&fw_mem_dump_ctx.req_completion,
+                            msecs_to_jiffies(FW_MEM_DUMP_TIMEOUT_MS));
+   if (0 >= result )
    {
       hddLog(VOS_TRACE_LEVEL_ERROR,
-          "%s: fw_mem_dump_req timeout %d ", __func__,ret);
+          "%s: fw_mem_dump_req timeout %d ", __func__,result);
       ret = -ETIMEDOUT;
-   }else {
-       priv = hdd_request_priv(request);
-       dump_status = priv->status;
    }
 cleanup:
-   hdd_request_put(request);
-   if(!ret && !dump_status)
+   spin_lock(&hdd_context_lock);
+   fw_mem_dump_ctx.magic = 0;
+   if(!ret && !fw_mem_dump_ctx.status)
       ret = -EFAULT;
+   spin_unlock(&hdd_context_lock);
 
    EXIT();
    return ret;
@@ -15674,22 +15602,27 @@ cleanup:
 /**
  * HDD callback which will be called by SVC to indicate mem dump completion.
  */
-void wlan_hdd_fw_mem_dump_req_cb(void *context)
+void wlan_hdd_fw_mem_dump_req_cb(struct hdd_fw_mem_dump_req_ctx* pHddFwMemDumpCtx)
 {
-	struct hdd_request *request;
-	struct fw_mem_dump_priv *priv;
-
-	request = hdd_request_get(context);
-	if (!request) {
-		hddLog(VOS_TRACE_LEVEL_ERROR, FL("Obsolete request"));
-		return;
-	}
-
-	priv = hdd_request_priv(request);
-	priv->status = true;
-
-	hdd_request_complete(request);
-	hdd_request_put(request);
+   if (!pHddFwMemDumpCtx) {
+       hddLog(VOS_TRACE_LEVEL_ERROR,
+          "%s: HDD context not valid ", __func__);
+       return;
+   }
+   spin_lock(&hdd_context_lock);
+   /* check the req magic and set status */
+   if (pHddFwMemDumpCtx->magic == FW_MEM_DUMP_MAGIC)
+   {
+       pHddFwMemDumpCtx->status = true;
+       //signal the completion
+       complete(&(pHddFwMemDumpCtx->req_completion));
+   }
+   else
+   {
+       hddLog(VOS_TRACE_LEVEL_ERROR,
+          "%s: fw mem dump request possible timeout ", __func__);
+   }
+   spin_unlock(&hdd_context_lock);
 }
 
 void hdd_initialize_adapter_common(hdd_adapter_t *pAdapter)
